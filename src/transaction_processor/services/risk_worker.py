@@ -89,16 +89,42 @@ def main() -> None:
                 # NOT committed. The process exits; on restart the message is re-read.
                 raise
             except Exception as exc:  # noqa: BLE001
+                # E7: a "poison" message (bad JSON or missing fields) can't be processed.
+                # Route it to the DLQ, then STILL commit the source offset so one bad
+                # event cannot block the partition for every message queued behind it.
+                txn_id, card_id = "unknown", "unknown"
+                try:
+                    parsed = from_json_bytes(msg.value())
+                    # Prefer the envelope's top-level ids, but fall back to body so a
+                    # malformed-but-parseable record is still traceable.
+                    body = parsed.get("body") if isinstance(parsed, dict) else None
+                    body = body if isinstance(body, dict) else {}
+                    txn_id = parsed.get("txn_id") or body.get("txn_id") or "unknown"
+                    card_id = parsed.get("card_id") or body.get("card_id") or "unknown"
+                except Exception:  # noqa: BLE001 - message may not even be valid JSON
+                    pass
+
                 dlq_event = build_event(
                     event_type=TOPICS["dlq"],
-                    txn_id="unknown",
-                    card_id="unknown",
-                    body={"error": str(exc), "raw": msg.value().decode("utf-8", errors="ignore")},
+                    txn_id=txn_id,
+                    card_id=card_id,
+                    body={
+                        "error": str(exc),
+                        "source_topic": msg.topic(),
+                        "source_partition": msg.partition(),
+                        "source_offset": msg.offset(),
+                        "raw": msg.value().decode("utf-8", errors="ignore"),
+                    },
                 )
-                producer.produce(topic=TOPICS["dlq"], value=to_json_bytes(dlq_event))
+                # Preserve per-card grouping in the DLQ when the key is recoverable.
+                dlq_key = card_id.encode("utf-8") if card_id != "unknown" else None
+                producer.produce(topic=TOPICS["dlq"], key=dlq_key, value=to_json_bytes(dlq_event))
                 producer.poll(0)
                 consumer.commit(message=msg, asynchronous=False)
-                print(f"sent bad message to dlq error={exc}")
+                print(
+                    f"[{WORKER_ID}] DLQ <- poison txn={txn_id} "
+                    f"src={msg.topic()}#{msg.partition()} @{msg.offset()} error={exc}"
+                )
     except KeyboardInterrupt:
         print(f"[{WORKER_ID}] risk-worker stopping")
     finally:

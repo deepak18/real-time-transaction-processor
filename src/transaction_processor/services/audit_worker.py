@@ -29,12 +29,21 @@ def main() -> None:
                 print(f"consumer error: {msg.error()}")
                 continue
 
-            event = from_json_bytes(msg.value())
-            print(
-                "audit "
-                f"topic={msg.topic()} partition={msg.partition()} offset={msg.offset()} "
-                f"txn_id={event.get('txn_id')} event_type={event.get('event_type')}"
-            )
+            # E7: a poison record (e.g., bad-json) may be un-parseable; never let one
+            # bad message crash the auditor. Log a fallback line and keep going.
+            try:
+                event = from_json_bytes(msg.value())
+                print(
+                    "audit "
+                    f"topic={msg.topic()} partition={msg.partition()} offset={msg.offset()} "
+                    f"txn_id={event.get('txn_id')} event_type={event.get('event_type')}"
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    "audit UNPARSEABLE "
+                    f"topic={msg.topic()} partition={msg.partition()} offset={msg.offset()} "
+                    f"error={exc}"
+                )
             consumer.commit(message=msg, asynchronous=False)
     except KeyboardInterrupt:
         print("audit-worker stopping")

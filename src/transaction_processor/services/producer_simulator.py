@@ -61,15 +61,48 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Produce transaction created events")
     parser.add_argument("--count", type=int, default=20)
     parser.add_argument("--sleep-ms", type=int, default=100)
+    # E7: inject malformed "poison" messages onto txn.created to exercise the DLQ path.
+    parser.add_argument(
+        "--poison",
+        type=int,
+        default=0,
+        help="E7: number of malformed messages to inject (interleaved with good ones)",
+    )
+    parser.add_argument(
+        "--poison-kind",
+        choices=["missing-field", "bad-json"],
+        default="missing-field",
+        help=(
+            "missing-field: valid envelope but body has no 'amount' (fails in risk_engine); "
+            "bad-json: raw non-JSON bytes (fails at deserialization)"
+        ),
+    )
     return parser.parse_args()
 
 
-def main() -> None:
-    args = parse_args()
-    producer = Producer(producer_config())
+def produce_good(producer: Producer, index: int) -> None:
+    txn = generate_transaction(index)
+    event = build_event(
+        event_type=TOPICS["created"],
+        txn_id=txn["txn_id"],
+        card_id=txn["card_id"],
+        body=txn,
+    )
+    producer.produce(
+        topic=TOPICS["created"],
+        key=txn["card_id"].encode("utf-8"),
+        value=to_json_bytes(event),
+        on_delivery=delivery_report,
+    )
+    producer.poll(0)
+    print(f"produced txn={txn['txn_id']} card_id={txn['card_id']} amount={txn['amount']}")
 
-    for index in range(args.count):
+
+def produce_poison(producer: Producer, kind: str, index: int) -> None:
+    """E7: emit a deliberately un-processable message onto txn.created."""
+    if kind == "missing-field":
         txn = generate_transaction(index)
+        txn.pop("amount", None)  # risk_engine does float(txn["amount"]) -> KeyError
         event = build_event(
             event_type=TOPICS["created"],
             txn_id=txn["txn_id"],
@@ -82,8 +115,44 @@ def main() -> None:
             value=to_json_bytes(event),
             on_delivery=delivery_report,
         )
-        producer.poll(0)
-        print(f"produced txn={txn['txn_id']} card_id={txn['card_id']} amount={txn['amount']}")
+        print(f"produced POISON(missing-field) txn={txn['txn_id']} card_id={txn['card_id']}")
+    else:  # bad-json
+        # Not valid JSON at all -> fails in from_json_bytes before any field is read.
+        producer.produce(
+            topic=TOPICS["created"],
+            key=b"card-poison",
+            value=b"{not-valid-json: missing amount",
+            on_delivery=delivery_report,
+        )
+        print("produced POISON(bad-json) key=card-poison")
+    producer.poll(0)
+
+
+def _poison_points(count: int, poison: int) -> set[int]:
+    """Evenly spaced indices after which to inject a poison message (never last)."""
+    if poison <= 0 or count <= 0:
+        return set()
+    step = max(count // (poison + 1), 1)
+    return {min(i * step, count - 1) for i in range(1, poison + 1)}
+
+
+def main() -> None:
+    args = parse_args()
+    producer = Producer(producer_config())
+
+    # If only poison is requested (no good traffic), just emit the poison messages.
+    if args.count == 0 and args.poison > 0:
+        for i in range(args.poison):
+            produce_poison(producer, args.poison_kind, i)
+            time.sleep(max(args.sleep_ms, 0) / 1000)
+        producer.flush()
+        return
+
+    poison_points = _poison_points(args.count, args.poison)
+    for index in range(args.count):
+        produce_good(producer, index)
+        if index in poison_points:
+            produce_poison(producer, args.poison_kind, index)
         time.sleep(max(args.sleep_ms, 0) / 1000)
 
     producer.flush()
