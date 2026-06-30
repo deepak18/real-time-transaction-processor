@@ -201,7 +201,7 @@ findings.
 ### 5.2 Experiments to run (hands-on)
 > Tip: use the Kafka UI to watch partitions, consumer-group assignments, and lag while doing these.
 
-- **E1 — Partition fan-out & ordering**
+- **E1 — Partition fan-out & ordering** ✅ (done — see Findings Log)
   - Produce many transactions across several `card_id`s with `producer_simulator`.
   - Observe how messages spread across the 3 partitions of `txn.created`.
   - Verify all events for one `card_id` land on the **same** partition (ordering proof).
@@ -279,7 +279,13 @@ findings.
 ## 8. Findings Log (append as you experiment)
 > Format: `- [E#] date — what you changed — what you observed — takeaway`
 
-- _(empty — add entries as experiments are completed)_
+- [E1] 2026-06-29 — Added a delivery-report callback to `producer_simulator` that prints
+  each record's partition/offset, a `card_id → partition` map, and a fan-out summary.
+  Ran `--count 30` with 5 cards over 3 partitions. — Observed 6 records/card (even per key)
+  but skewed per partition: **p0=6 (1 card), p1=12 (2 cards), p2=12 (2 cards)**. Mapping is
+  deterministic across re-runs. — Takeaway: same key → same partition gives per-card ordering,
+  but with few keys the load is unavoidably skewed (1/2/2 split). Even key distribution ≠ even
+  partition load; this is the hot-partition tension. Confirmed in Kafka UI.
 
 ---
 
@@ -292,4 +298,3 @@ findings.
 - The sibling project `kafka-streaming-orders` is **separate** — do not couple them.
 - Keep changes production-grade and within the established `src/transaction_processor/...`
   structure; avoid dropping loose scripts into the package.
-
