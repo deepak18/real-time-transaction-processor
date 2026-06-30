@@ -6,6 +6,7 @@ from collections import Counter
 
 from confluent_kafka import KafkaError, Message, Producer
 
+from src.transaction_processor.common.config import settings
 from src.transaction_processor.common.events import build_event, to_json_bytes
 from src.transaction_processor.common.kafka_client import producer_config
 from src.transaction_processor.common.topics import TOPICS
@@ -139,6 +140,8 @@ def _poison_points(count: int, poison: int) -> set[int]:
 def main() -> None:
     args = parse_args()
     producer = Producer(producer_config())
+    # E10: surface the durability level in use for this run.
+    print(f"producer acks={settings.producer_acks}")
 
     # If only poison is requested (no good traffic), just emit the poison messages.
     if args.count == 0 and args.poison > 0:

@@ -7,6 +7,8 @@ def producer_config() -> Dict[str, Any]:
     return {
         "bootstrap.servers": settings.kafka_bootstrap_servers,
         "client.id": "transaction-processor",
+        # E10: durability vs latency trade-off (acks=0|1|all).
+        "acks": settings.producer_acks,
     }
 
 

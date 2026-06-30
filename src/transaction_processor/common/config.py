@@ -16,6 +16,12 @@ class Settings:
         "KAFKA_PARTITION_ASSIGNMENT_STRATEGY", "range,roundrobin"
     )
 
+    # E10: producer durability/ack level.
+    # "0" = fire-and-forget (no broker ack, fastest, can lose data),
+    # "1" = leader-only ack,
+    # "all" = leader + all in-sync replicas (safest); # only meaningful once replication_factor > 1.
+    producer_acks: str = os.getenv("KAFKA_PRODUCER_ACKS", "all")
+
     # Docs: disable Swagger UI in production to avoid exposing internals
     DOCS_URL: str | None = "/docs"
     REDOC_URL: str | None = "/redoc"
