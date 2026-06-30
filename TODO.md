@@ -99,6 +99,7 @@ real-time-transaction-processor/
 │   │   └── schemas.py           # Pydantic request/response models
 │   └── services/                # long-running workers + admin tools
 │       ├── topic_admin.py       # creates all topics with configured partitions/RF
+│       ├── offset_admin.py      # inspect / reset consumer-group offsets (E5 replay tool)
 │       ├── producer_simulator.py# CLI to generate synthetic transactions
 │       ├── risk_worker.py       # txn.created → txn.risk_scored
 │       ├── decision_worker.py   # txn.risk_scored → txn.authorized | txn.declined
@@ -222,9 +223,21 @@ findings.
   - Confirm `audit-cg` and `risk-cg` both receive `txn.created`-derived events independently
     (different offsets, no competition).
 
-- **E5 — Offset reset / replay**
-  - Stop a worker, delete/reset its group offsets, restart with `auto.offset.reset=earliest`,
-    and watch it **replay** history. Contrast with `latest`.
+- **E5 — Offset reset / replay** ✅ (done — see Findings Log)
+  - A group's committed offset is **server-side state**; `auto.offset.reset` only applies when a
+    group has **no** committed offset. Use `services/offset_admin.py` to inspect and reset it.
+  - Steps: (1) run the pipeline so `risk-cg` commits offsets; (2) **stop** `risk_worker`;
+    (3) `offset_admin --group risk-cg` to SHOW offsets/lag; (4) `--reset earliest` to rewind;
+    (5) restart `risk_worker` and watch it **replay** all history. Contrast `--reset latest`
+    (skip backlog → only new messages).
+  ```powershell
+  # inspect current position + lag
+  python -m src.transaction_processor.services.offset_admin --group risk-cg --topic txn.created
+  # rewind to replay everything (stop risk_worker first)
+  python -m src.transaction_processor.services.offset_admin --group risk-cg --reset earliest
+  # or fast-forward to skip the backlog
+  python -m src.transaction_processor.services.offset_admin --group risk-cg --reset latest
+  ```
 
 - **E6 — At-least-once proof (duplicate delivery)**
   - Add an artificial crash *after* producing the output event but *before* committing the
@@ -328,6 +341,18 @@ findings.
   independent copy of the stream (pub/sub), whereas members of one group divide partitions. This
   is how you bolt on new consumers (audit, analytics, fraud) without touching existing ones. Also
   note both records sat on partition 2 — same `card_id` key → same partition across topics.
+
+- [E5] 2026-06-30 — Added `services/offset_admin.py` (show/reset group offsets) and exercised
+  replay on `risk-cg`/`txn.created`. — Start: caught up (`committed` = `high`, `total_lag=0`).
+  `--reset earliest` moved committed to the **low watermarks (20/40/40, not 0)** and lag jumped to
+  **301** (54+123+124) — restarting the worker replayed that history. `--reset latest` moved
+  committed back to the **high watermarks**, `total_lag=0`, so a restart processes only new
+  messages. — Takeaways: (1) offsets are durable, **per-group, server-side** state; resetting one
+  group doesn't touch others. (2) `auto.offset.reset` is only a *bootstrap* fallback; replay
+  requires explicitly rewinding committed offsets. (3) **You can only rewind as far back as the
+  low watermark** — older records (offsets 0–19 / 0–39) had already aged out via retention, which
+  is why replay started at 20/40/40. (4) Replay under at-least-once re-emits duplicates downstream
+  → motivates idempotency (Phase 3). Concept notes in `docs/LEARNING_NOTES.md` §1.5.
 
 ---
 
