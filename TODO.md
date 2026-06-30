@@ -261,7 +261,7 @@ findings.
     drive high producer rate; watch **lag** grow in Kafka UI / `offset_admin`. Discuss backpressure
     strategies.
 
-- **E10 — `acks` & durability (conceptual + config)**
+- **E10 — `acks` & durability (conceptual + config)** ✅ (done — see Findings Log)
   - Experiment with producer `acks=0|1|all` and discuss data-loss trade-offs (full durability
     benefits need `replication.factor > 1`, which arrives in Phase 10).
 
@@ -400,6 +400,20 @@ findings.
   backlog means slower recovery, not loss. (4) An idle partition (p3) contributes zero lag and
   zero work — skew leaves some consumers hot and others idle. Concept notes in
   `docs/LEARNING_NOTES.md`.
+
+- [E10] 2026-06-30 — Made the producer ack level env-driven (`KAFKA_PRODUCER_ACKS`, default `all`)
+  via `common/config.py` + `kafka_client.producer_config()`, and had `producer_simulator` print
+  the active mode at startup. Ran with `acks=all`, `acks=1`, and `acks=0`. — All three produced
+  successfully against the local single broker; the startup line confirmed the mode each run.
+  Because the cluster runs `replication.factor=1` (no followers), `acks=all` and `acks=1` behave
+  **identically** today — the leader is the only replica, so "all in-sync replicas" *is* the
+  leader. `acks=0` returns without waiting for any broker ack (fastest, but a loss at the wrong
+  moment is invisible to the delivery report). — Takeaways: (1) `acks` trades **latency vs
+  durability**: 0 = fire-and-forget, 1 = leader persisted, all = leader + all ISR. (2) The real
+  durability win of `acks=all` only materializes with **`replication.factor > 1`** plus
+  `min.insync.replicas` — there's nothing to replicate to yet. (3) This sets up **Phase 10
+  (multi-broker)** where we raise RF and can actually demonstrate fault-tolerant durability.
+  Concept notes in `docs/LEARNING_NOTES.md`.
 
 ---
 

@@ -28,6 +28,7 @@
   - [1.7 Poison messages & the dead-letter queue (E7)](#17-poison-messages--the-dead-letter-queue-e7)
   - [1.8 Increasing partitions & the re-keying risk (E8)](#18-increasing-partitions--the-re-keying-risk-e8)
   - [1.9 Consumer lag & backpressure (E9)](#19-consumer-lag--backpressure-e9)
+  - [1.10 Producer acks & durability (E10)](#110-producer-acks--durability-e10)
 
 ---
 
@@ -244,6 +245,8 @@ Remove-Item Env:KAFKA_PARTITION_ASSIGNMENT_STRATEGY
 | `SETTLEMENT_DELAY_SECONDS` | `1.0` | Simulated settlement delay |
 | `KAFKA_PARTITION_ASSIGNMENT_STRATEGY` | `range,roundrobin` | Consumer assignor (eager vs `cooperative-sticky`) |
 | `RISK_WORKER_CRASH_AFTER_PRODUCE` | `0` | E6 fault hook: `1` crashes `risk_worker` after producing `txn.risk_scored` but before committing the offset (duplicate-delivery demo) |
+| `RISK_WORKER_PROCESS_DELAY_MS` | `0` | E9: ms to sleep per message in `risk_worker` (simulate slow processing so lag grows) |
+| `KAFKA_PRODUCER_ACKS` | `all` | E10: producer durability — `0` (no ack), `1` (leader), `all` (leader + all ISR) |
 
 **Everyday commands.**
 ```powershell
@@ -512,6 +515,9 @@ python -m src.transaction_processor.services.risk_worker
 python -m src.transaction_processor.services.producer_simulator --count 300 --sleep-ms 5
 # Terminal C — watch lag climb (or use Kafka UI -> Consumers -> risk-cg)
 python -m src.transaction_processor.services.offset_admin --group risk-cg --topic txn.created
+
+# Restart WITHOUT the process delay so it consumes normally this time
+Remove-Item Env:RISK_WORKER_PROCESS_DELAY_MS
 ```
 
 **How to validate (E9 observed, 6 partitions / 3 slow consumers).**
@@ -543,4 +549,56 @@ incident response in production stream systems.
   find the real bottleneck before scaling blindly.
 - Retention is the real backstop: if lag exceeds what retention holds, unprocessed records can **age
   out** (low watermark passes committed) → data loss. Monitor lag against retention.
+
+---
+
+## 1.10 Producer acks & durability (E10)
+
+**Concept.** A producer's **`acks`** setting decides how many broker replicas must acknowledge a
+write before the producer considers it successful. It is the core **latency-vs-durability** dial:
+weaker acks are faster but risk silent data loss; stronger acks are slower but guarantee the record
+survives broker failures.
+
+**How it works.**
+
+| `acks` | Producer waits for | Durability | Risk |
+|---|---|---|---|
+| `0` | nothing (fire-and-forget) | lowest | record lost on any hiccup; delivery report can't confirm it |
+| `1` | leader writes to its log | medium | lost if the leader dies before a follower replicates |
+| `all` (`-1`) | leader **+ all in-sync replicas** | highest | none, as long as ≥ `min.insync.replicas` stay up |
+
+- `acks=all` only adds safety when there are **followers to replicate to** — it works together with
+  **`replication.factor > 1`** and **`min.insync.replicas`** (the minimum ISR count that must ack).
+- The producer's delivery-report callback fires after the configured acks are satisfied, so under
+  `acks=0` "delivered" really means "handed to the socket", not "stored".
+
+**How to test.** `acks` is env-driven (`KAFKA_PRODUCER_ACKS`); `producer_simulator` prints the mode
+at startup:
+```powershell
+python -m src.transaction_processor.services.producer_simulator --count 20            # acks=all (default)
+$env:KAFKA_PRODUCER_ACKS = "1"; python -m src.transaction_processor.services.producer_simulator --count 20
+$env:KAFKA_PRODUCER_ACKS = "0"; python -m src.transaction_processor.services.producer_simulator --count 20
+Remove-Item Env:KAFKA_PRODUCER_ACKS
+```
+
+**How to validate (E10 observed).**
+- The startup line `producer acks=<mode>` confirms the active setting each run.
+- All three modes succeed against the local broker. **Crucially, with `replication.factor=1`
+  (current local setup) `acks=all` and `acks=1` are identical** — the leader is the only replica, so
+  "all in-sync replicas" *is* the leader. There is nothing to replicate to yet.
+- `acks=0` returns fastest and never blocks on a broker ack.
+
+**Why it's helpful.** Payment events must not vanish, so production pipelines run `acks=all` with
+`replication.factor ≥ 3` and `min.insync.replicas = 2`. Understanding the dial now sets up the
+multi-broker phase where the durability guarantee becomes real and demonstrable.
+
+**Gotchas.**
+- **`acks=all` with `replication.factor=1` buys you nothing** — a common misconfiguration that
+  *feels* safe but isn't. Durability needs replicas (Phase 10).
+- `acks=0` can lose data **silently**: the delivery report shows success because there's no ack to
+  fail on. Never use it for financial events.
+- For true no-duplicate **and** no-loss delivery you also need the **idempotent producer**
+  (`enable.idempotence=true`) and/or transactions (EOS) — that's Phase 3, separate from `acks`.
+- `min.insync.replicas` is enforced **per topic/broker**, not by the producer; `acks=all` only
+  honors it when the cluster actually has that many in-sync replicas, else produce fails.
 
