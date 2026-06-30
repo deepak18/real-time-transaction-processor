@@ -1,17 +1,36 @@
-from confluent_kafka import Consumer, Producer
+import os
+
+from confluent_kafka import Consumer, Producer, TopicPartition
 
 from src.transaction_processor.common.events import build_event, from_json_bytes, to_json_bytes
 from src.transaction_processor.common.kafka_client import consumer_config, producer_config
 from src.transaction_processor.common.topics import GROUP_IDS, TOPICS
 from src.transaction_processor.domain.risk_engine import score_transaction
 
+# E2: a short per-process id so multiple instances are distinguishable in logs.
+WORKER_ID = f"risk-{os.getpid()}"
+
+
+def _fmt(parts: list[TopicPartition]) -> str:
+    return ", ".join(f"{p.topic}#{p.partition}" for p in parts) or "<none>"
+
+
+def on_assign(consumer: Consumer, partitions: list[TopicPartition]) -> None:
+    # E2: fired after a rebalance when this consumer GAINS partitions.
+    print(f"[{WORKER_ID}] ASSIGNED -> {_fmt(partitions)}")
+
+
+def on_revoke(consumer: Consumer, partitions: list[TopicPartition]) -> None:
+    # E2: fired before a rebalance when this consumer is about to LOSE partitions.
+    print(f"[{WORKER_ID}] REVOKED  -> {_fmt(partitions)}")
+
 
 def main() -> None:
     consumer = Consumer(consumer_config(group_id=GROUP_IDS["risk"]))
     producer = Producer(producer_config())
-    consumer.subscribe([TOPICS["created"]])
+    consumer.subscribe([TOPICS["created"]], on_assign=on_assign, on_revoke=on_revoke)
 
-    print("risk-worker listening on txn.created")
+    print(f"[{WORKER_ID}] risk-worker listening on txn.created")
     try:
         while True:
             msg = consumer.poll(1.0)
@@ -38,7 +57,10 @@ def main() -> None:
                 )
                 producer.poll(0)
                 consumer.commit(message=msg, asynchronous=False)
-                print(f"risk scored txn={txn_event['txn_id']} score={result['risk_score']}")
+                print(
+                    f"[{WORKER_ID}] risk scored txn={txn_event['txn_id']} "
+                    f"partition={msg.partition()} score={result['risk_score']}"
+                )
             except Exception as exc:  # noqa: BLE001
                 dlq_event = build_event(
                     event_type=TOPICS["dlq"],
@@ -51,7 +73,7 @@ def main() -> None:
                 consumer.commit(message=msg, asynchronous=False)
                 print(f"sent bad message to dlq error={exc}")
     except KeyboardInterrupt:
-        print("risk-worker stopping")
+        print(f"[{WORKER_ID}] risk-worker stopping")
     finally:
         producer.flush()
         consumer.close()

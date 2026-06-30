@@ -206,7 +206,7 @@ findings.
   - Observe how messages spread across the 3 partitions of `txn.created`.
   - Verify all events for one `card_id` land on the **same** partition (ordering proof).
 
-- **E2 — Scale a consumer group**
+- **E2 — Scale a consumer group** ✅ (done — see Findings Log)
   - Start **two** `risk_worker` instances (same group `risk-cg`).
   - Watch partitions get split between them; kill one and watch a **rebalance** reassign
     partitions to the survivor. Note the brief pause.
@@ -286,6 +286,15 @@ findings.
   deterministic across re-runs. — Takeaway: same key → same partition gives per-card ordering,
   but with few keys the load is unavoidably skewed (1/2/2 split). Even key distribution ≠ even
   partition load; this is the hot-partition tension. Confirmed in Kafka UI.
+
+- [E2] 2026-06-30 — Added `on_assign`/`on_revoke` rebalance callbacks and a per-process
+  `WORKER_ID` to `risk_worker`, then ran two instances against the 3-partition `txn.created`.
+  — With both alive: instance #1 owned `txn.created#2`; instance #2 owned `txn.created#0` and
+  `#1` (3 partitions split with no overlap). On killing instance #2, the survivor first got
+  `#2` **REVOKED**, then **ASSIGNED** all three (`#0, #1, #2`) — the classic *eager* rebalance
+  (revoke-all-then-reassign). — Takeaway: each partition is owned by exactly one consumer in a
+  group; adding/removing members auto-redistributes partitions via a rebalance, and the default
+  eager protocol briefly revokes everything (stop-the-world pause) before reassigning.
 
 ---
 
