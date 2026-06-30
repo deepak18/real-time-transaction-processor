@@ -24,6 +24,7 @@
   - [1.3 Rebalancing: eager vs cooperative-sticky (E2 follow-up)](#13-rebalancing-eager-vs-cooperative-sticky-e2-follow-up)
   - [1.4 Config & command cheat-sheet](#14-config--command-cheat-sheet)
   - [1.5 Offsets, commits & replay (E5)](#15-offsets-commits--replay-e5)
+  - [1.6 Delivery semantics & at-least-once duplicates (E6)](#16-delivery-semantics--at-least-once-duplicates-e6)
 
 ---
 
@@ -239,6 +240,7 @@ Remove-Item Env:KAFKA_PARTITION_ASSIGNMENT_STRATEGY
 | `KAFKA_REPLICATION_FACTOR` | `1` | Replicas per partition (1 = no HA locally) |
 | `SETTLEMENT_DELAY_SECONDS` | `1.0` | Simulated settlement delay |
 | `KAFKA_PARTITION_ASSIGNMENT_STRATEGY` | `range,roundrobin` | Consumer assignor (eager vs `cooperative-sticky`) |
+| `RISK_WORKER_CRASH_AFTER_PRODUCE` | `0` | E6 fault hook: `1` crashes `risk_worker` after producing `txn.risk_scored` but before committing the offset (duplicate-delivery demo) |
 
 **Everyday commands.**
 ```powershell
@@ -305,3 +307,69 @@ disturbs `audit-cg`.
   Both can also reset **to a timestamp** (e.g., "replay since 09:00"), which our tool could add via
   `--to-timestamp` later.
 
+---
+
+## 1.6 Delivery semantics & at-least-once duplicates (E6)
+
+**Concept.** A consumer's **commit placement** decides the delivery guarantee. Our workers
+`produce` the output event and only then `commit` the *source* offset — **commit-after-process**.
+If the worker dies in the gap between *produce* and *commit*, the source message is **never marked
+done**, so on restart it is **re-read and reprocessed**, emitting the downstream event **again**.
+That is **at-least-once**: every message is processed *one or more* times, never lost, but possibly
+duplicated.
+
+| Guarantee | Commit placement | Failure outcome |
+|---|---|---|
+| At-most-once | commit **before** processing | crash → message **lost** (never reprocessed) |
+| **At-least-once (current)** | commit **after** processing | crash → message **duplicated** (reprocessed) |
+| Exactly-once (Phase 3) | transactional produce+commit (EOS) | crash → **no loss, no duplicate** |
+
+**How it works (the exact gap).** In `risk_worker.py`:
+1. `producer.produce(txn.risk_scored, ...)` then `producer.flush()` → output is **durable on the broker**.
+2. **← crash window →** offset for `txn.created` is still **uncommitted**.
+3. `consumer.commit(msg)` → only now is the source message marked processed.
+
+A crash at step 2 means restart re-reads the same `txn.created` and runs step 1 again → a **second**
+`txn.risk_scored` with the **same `txn_id`**.
+
+**How to test.** An env-guarded fault hook (`RISK_WORKER_CRASH_AFTER_PRODUCE`, OFF by default)
+raises `_FaultInjected` right after `flush()` and before `commit()`. The hook re-raises past the DLQ
+handler so the offset is **not** committed.
+```powershell
+# Terminal A — audit (watch for the duplicate txn_id)
+python -m src.transaction_processor.services.audit_worker
+
+# Terminal B — produce ONE transaction
+uvicorn src.transaction_processor.api.main:app --port 8000   # then POST one txn
+# or: python -m src.transaction_processor.services.producer_simulator --count 1
+
+# Terminal C — risk_worker with the fault hook ON (it will crash after producing)
+$env:RISK_WORKER_CRASH_AFTER_PRODUCE = "1"
+python -m src.transaction_processor.services.risk_worker      # produces, then crashes pre-commit
+
+# Restart WITHOUT the hook so it completes normally this time
+Remove-Item Env:RISK_WORKER_CRASH_AFTER_PRODUCE
+python -m src.transaction_processor.services.risk_worker      # re-reads + RE-PRODUCES the same txn
+```
+
+**How to validate.**
+- `audit_worker` logs **two** `txn.risk_scored` records for the **same `txn_id`** (one before the
+  crash, one after restart).
+- Kafka UI → `txn.risk_scored` → **2 messages** for that card/partition; `risk-cg` lag on
+  `txn.created` was **> 0** after the crash (offset never advanced) and returns to 0 after restart.
+- Count check: with `--count 1` produced, `txn.risk_scored` ends with **2** events, not 1.
+
+**Why it's helpful.** This is the concrete failure that causes **double settlement** in payments: a
+retried/reprocessed authorization can pay twice. Seeing the duplicate first is what *justifies*
+Phase 3 (idempotency / exactly-once) — we add the fix only after demonstrating the problem.
+
+**Gotchas.**
+- The hook **must** escape the DLQ `except` block; otherwise the catch-all would route to `txn.dlq`
+  **and commit** the offset, hiding the duplicate. We re-raise `_FaultInjected` for exactly this.
+- `flush()` before the crash is deliberate — without it the output might still be buffered in
+  memory and never reach the broker, so you'd see a *lost* message (at-most-once) instead of a
+  duplicate.
+- `enable.auto.commit=False` means `consumer.close()` in `finally` does **not** sneak in a commit;
+  the offset truly stays put across the crash.
+- The duplicate is **downstream** (`txn.risk_scored`); the source `txn.created` is read twice but
+  exists once. Idempotency must therefore key on a stable id (`txn_id`), not on re-delivery counts.

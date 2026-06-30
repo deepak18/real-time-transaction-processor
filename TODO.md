@@ -239,10 +239,11 @@ findings.
   python -m src.transaction_processor.services.offset_admin --group risk-cg --reset latest
   ```
 
-- **E6 — At-least-once proof (duplicate delivery)**
-  - Add an artificial crash *after* producing the output event but *before* committing the
-    offset in `risk_worker`. Restart and observe the **duplicate** `txn.risk_scored`.
-  - This motivates Phase 3 (idempotency/EOS).
+- **E6 — At-least-once proof (duplicate delivery)** ✅ (done — see Findings Log)
+  - Env-guarded fault hook `RISK_WORKER_CRASH_AFTER_PRODUCE=1` raises in `risk_worker` *after*
+    producing/flushing `txn.risk_scored` but *before* `consumer.commit(...)`. Restart (hook off)
+    and observe the **duplicate** `txn.risk_scored` for the same `txn_id`.
+  - This motivates Phase 3 (idempotency/EOS). See `docs/LEARNING_NOTES.md` §1.6 for run/validate.
 
 - **E7 — Poison message → DLQ**
   - Produce a malformed event onto `txn.created` (e.g., missing `amount`).
@@ -351,8 +352,24 @@ findings.
   group doesn't touch others. (2) `auto.offset.reset` is only a *bootstrap* fallback; replay
   requires explicitly rewinding committed offsets. (3) **You can only rewind as far back as the
   low watermark** — older records (offsets 0–19 / 0–39) had already aged out via retention, which
-  is why replay started at 20/40/40. (4) Replay under at-least-once re-emits duplicates downstream
-  → motivates idempotency (Phase 3). Concept notes in `docs/LEARNING_NOTES.md` §1.5.
+  why replay started at 20/40/40. (4) Replay under at-least-once re-emits duplicates downstream
+  → motivates idempotency (Phase 3). Concept notes in `docs/LEARNING_NOTES.md`.
+
+- [E6] 2026-06-30 — Added an env-guarded fault hook to `risk_worker`
+  (`RISK_WORKER_CRASH_AFTER_PRODUCE=1`) that flushes the produced `txn.risk_scored` then raises
+  `_FaultInjected` **before** `consumer.commit(...)`; the hook re-raises past the DLQ handler so
+  the offset is never committed. Produced one txn and ran the worker with the hook ON, then
+  restarted with it OFF. — Run 1 (`risk-22668`) logged `E6 fault: produced txn.risk_scored for
+  txn=deed6e5a-… but crashing BEFORE commit` and died (offset uncommitted). Run 2 (`risk-9364`)
+  re-read the same `txn.created` and logged `risk scored txn=deed6e5a-… partition=2 score=35`.
+  `audit_worker` recorded the proof: **two** `txn.risk_scored` for the same `txn_id` at
+  **partition=2 offset=412 and offset=413** (source `txn.created` read once at offset 164). —
+  Takeaways: (1) commit-after-process = **at-least-once**: a crash in the produce→commit gap
+  re-delivers the source and **re-emits** the downstream event (duplicate, never lost). (2) The
+  duplicate `txn_id` is identical, so safe reprocessing must dedup on a **stable id**, not on
+  delivery count. (3) Both duplicates landed on the same partition (same `card_id` key → ordering
+  preserved even across the crash). (4) This is the exact double-settlement failure mode that
+  motivates **Phase 3 (idempotency/EOS)**. Concept notes in `docs/LEARNING_NOTES.md`.
 
 ---
 

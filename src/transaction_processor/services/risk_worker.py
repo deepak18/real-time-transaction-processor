@@ -10,6 +10,17 @@ from src.transaction_processor.domain.risk_engine import score_transaction
 # E2: a short per-process id so multiple instances are distinguishable in logs.
 WORKER_ID = f"risk-{os.getpid()}"
 
+# E6: fault-injection hook (OFF by default). When RISK_WORKER_CRASH_AFTER_PRODUCE=1,
+# the worker crashes AFTER the output event has been durably produced (flushed) but
+# BEFORE the source offset is committed. On restart, the same txn.created message is
+# re-read and txn.risk_scored is emitted a SECOND time -> proves at-least-once delivery
+# and motivates idempotency/exactly-once (Phase 3).
+CRASH_AFTER_PRODUCE = os.getenv("RISK_WORKER_CRASH_AFTER_PRODUCE", "0") == "1"
+
+
+class _FaultInjected(Exception):
+    """Deliberate E6 crash to demonstrate at-least-once duplicate delivery."""
+
 
 def _fmt(parts: list[TopicPartition]) -> str:
     return ", ".join(f"{p.topic}#{p.partition}" for p in parts) or "<none>"
@@ -56,11 +67,27 @@ def main() -> None:
                     value=to_json_bytes(out_event),
                 )
                 producer.poll(0)
+
+                # E6: crash AFTER the output is durably on the broker but BEFORE the
+                # source offset is committed. flush() forces delivery so the duplicate
+                # we observe on restart is real (not a buffered, never-sent record).
+                if CRASH_AFTER_PRODUCE:
+                    producer.flush()
+                    print(
+                        f"[{WORKER_ID}] E6 fault: produced txn.risk_scored for "
+                        f"txn={txn_event['txn_id']} but crashing BEFORE commit"
+                    )
+                    raise _FaultInjected(txn_event["txn_id"])
+
                 consumer.commit(message=msg, asynchronous=False)
                 print(
                     f"[{WORKER_ID}] risk scored txn={txn_event['txn_id']} "
                     f"partition={msg.partition()} score={result['risk_score']}"
                 )
+            except _FaultInjected:
+                # E6: let the deliberate crash escape the DLQ handler so the offset is
+                # NOT committed. The process exits; on restart the message is re-read.
+                raise
             except Exception as exc:  # noqa: BLE001
                 dlq_event = build_event(
                     event_type=TOPICS["dlq"],
