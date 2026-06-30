@@ -134,6 +134,11 @@ python -m src.transaction_processor.services.producer_simulator --count 60 --sle
   cause is *partitions < consumers*, not the rebalance protocol.
 - Kafka UI → Consumers → `risk-cg` shows members, their partition assignments, and **lag**.
 - Kill an active member → a previously idle member immediately picks up the freed partition.
+- **Pub/sub across groups (E4):** run `risk_worker` (`risk-cg`) and `audit_worker` (`audit-cg`)
+  together — both log the **same** `txn.created` event for the same `txn_id`, each with its own
+  offset, neither stealing from the other. Observed: `risk scored … partition=2` alongside
+  `audit topic=txn.created partition=2` (and later `topic=txn.risk_scored partition=2`). Adding a
+  new `group.id` gives a fresh, independent copy of the stream.
 
 **Why it's helpful.** This is the core mechanism for **scaling stateless workers**: add instances,
 Kafka redistributes load — no coordinator, no code change. Separate groups enable independent
@@ -190,6 +195,16 @@ shrinks the blast radius to just the partitions that move, keeping the rest of t
   not supported.
 - Cooperative does **two** rebalance rounds to settle — expect a transient `<none>` assignment in
   the logs; that's normal, not a bug.
+
+**Q&A — "Closing instances one at a time didn't reassign the freed partition under
+cooperative-sticky. Is that expected?"** Partly. An orphaned partition is *always* reassigned to
+a surviving consumer (it can never be left unconsumed). It *looks* like nothing happens when the
+instance you close is an **idle standby** (owns 0 partitions → nothing to move). Once you close an
+instance that actually owns a partition (so consumers ≤ partitions), a survivor logs exactly one
+`ASSIGNED -> #X` while the others keep their partitions untouched (no revoke). Eager looked
+different only because it revokes everything from everyone on each change — visible churn — whereas
+cooperative moves just the orphan, which is easy to miss. To see it: keep producing load, close an
+**active** owner, and watch a survivor print `ASSIGNED -> #X` within ~1s.
 
 ---
 

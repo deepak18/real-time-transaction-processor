@@ -218,7 +218,7 @@ findings.
   - Observe that the 4th consumer stays **idle** (more consumers than partitions = waste).
   - Lesson: partition count is the ceiling on consumer parallelism.
 
-- **E4 — Separate consumer groups (pub/sub)**
+- **E4 — Separate consumer groups (pub/sub)** ✅ (done — see Findings Log)
   - Confirm `audit-cg` and `risk-cg` both receive `txn.created`-derived events independently
     (different offsets, no competition).
 
@@ -318,6 +318,16 @@ findings.
   so **partition count is the hard ceiling on parallelism** — extra consumers sit idle as hot
   standby (assignor-independent: the 4th is idle under both eager and cooperative). To scale past
   3 you must add partitions (E8), which can't later be reduced.
+
+- [E4] 2026-06-30 — Ran `risk_worker` (group `risk-cg`) and `audit_worker` (group `audit-cg`)
+  together while producing to `txn.created`. — For the same `txn_id`
+  (`94412b9f-…`), `risk_worker` logged `risk scored … partition=2` while `audit_worker`
+  independently logged **both** `topic=txn.created partition=2` and (after the chain advanced)
+  `topic=txn.risk_scored partition=2`. The two groups consumed the same event with their **own
+  offsets**, neither stealing from the other. — Takeaway: different `group.id`s each get a full,
+  independent copy of the stream (pub/sub), whereas members of one group divide partitions. This
+  is how you bolt on new consumers (audit, analytics, fraud) without touching existing ones. Also
+  note both records sat on partition 2 — same `card_id` key → same partition across topics.
 
 ---
 
