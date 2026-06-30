@@ -53,5 +53,6 @@
 ## Documentation source of truth
 - `README.md` is the runbook for setup and execution.
 - `TODO.md` is the broader project guide and roadmap; it explains why this repo is structured this way.
+- `docs/LEARNING_NOTES.md` is the timeless concept reference (per technology, Kafka first) for revising how each tool works and why.
 - Keep those docs in sync with any workflow or architecture change.
 

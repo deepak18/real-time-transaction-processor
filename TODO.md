@@ -84,6 +84,8 @@ real-time-transaction-processor/
 ├── requirements.txt             # confluent-kafka, fastapi, uvicorn, pydantic
 ├── README.md                    # setup + run instructions
 ├── TODO.md                      # THIS FILE — roadmap & project guide
+├── docs/
+│   └── LEARNING_NOTES.md        # timeless concept notes per technology (Kafka first) — revision reference
 ├── src/transaction_processor/
 │   ├── common/                  # cross-cutting shared code
 │   │   ├── config.py            # Settings dataclass (env-driven): bootstrap, partitions, RF, etc.
