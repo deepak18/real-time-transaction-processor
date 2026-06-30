@@ -256,9 +256,10 @@ findings.
     higher consumer parallelism. Discuss why you **can't reduce** partitions and how it affects
     key→partition mapping (re-keying risk).
 
-- **E9 — Consumer lag under load**
-  - Add a `time.sleep()` in a worker to simulate slow processing; drive high producer rate;
-    watch **lag** grow in Kafka UI. Discuss backpressure strategies.
+- **E9 — Consumer lag under load** ✅ (done — see Findings Log)
+  - Add a `time.sleep()` in a worker (`RISK_WORKER_PROCESS_DELAY_MS`) to simulate slow processing;
+    drive high producer rate; watch **lag** grow in Kafka UI / `offset_admin`. Discuss backpressure
+    strategies.
 
 - **E10 — `acks` & durability (conceptual + config)**
   - Experiment with producer `acks=0|1|all` and discuss data-loss trade-offs (full durability
@@ -371,7 +372,7 @@ findings.
   duplicate `txn_id` is identical, so safe reprocessing must dedup on a **stable id**, not on
   delivery count. (3) Both duplicates landed on the same partition (same `card_id` key → ordering
   preserved even across the crash). (4) This is the exact double-settlement failure mode that
-  motivates **Phase 3 (idempotency/EOS)**. Concept notes in `docs/LEARNING_NOTES.md` §1.6.
+  motivates **Phase 3 (idempotency/EOS)**. Concept notes in `docs/LEARNING_NOTES.md`.
 
 - [E8] 2026-06-30 — Extended `topic_admin` with `--describe` and `--alter NAME --partitions N`,
   then grew `txn.created` from **3 → 6** partitions and re-ran `producer_simulator` to compare the
@@ -384,7 +385,21 @@ findings.
   parallelism ceiling (now up to 6 `risk_worker`s do work) but (2) **changes key→partition mapping
   for future records**, so a card's new events can land on a different partition than its history —
   **breaking per-card ordering** across the change. (3) Partitions can only **grow**, never shrink,
-  so size deliberately up front. Concept notes in `docs/LEARNING_NOTES.md` §1.8.
+  so size deliberately up front. Concept notes in `docs/LEARNING_NOTES.md`.
+
+- [E9] 2026-06-30 — Added an env-guarded slow-processing knob to `risk_worker`
+  (`RISK_WORKER_PROCESS_DELAY_MS`) that sleeps per message, then ran a fast producer against
+  1/2/3 slow consumers on the 6-partition `txn.created` and watched lag via `offset_admin`. —
+  With 3 consumers sharing 6 partitions, a sample read was: p0 lag=26, p1 lag=46, p2 lag=45,
+  p3 `committed=<none>` lag=0 (no records routed there that run), p4 lag=44, p5 lag=27 →
+  **total_lag=188**. Adding consumers split partitions among them and they drained in parallel;
+  stopping the producer let lag fall as the backlog cleared. — Takeaways: (1) **lag = high −
+  committed** is the core health signal — it grows whenever ingest rate > processing rate.
+  (2) Backpressure remedies: scale consumers up to the partition ceiling, add partitions to raise
+  that ceiling (E8), speed up per-message work, or batch/shed load. (3) Under at-least-once a
+  backlog means slower recovery, not loss. (4) An idle partition (p3) contributes zero lag and
+  zero work — skew leaves some consumers hot and others idle. Concept notes in
+  `docs/LEARNING_NOTES.md`.
 
 ---
 

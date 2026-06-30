@@ -27,6 +27,7 @@
   - [1.6 Delivery semantics & at-least-once duplicates (E6)](#16-delivery-semantics--at-least-once-duplicates-e6)
   - [1.7 Poison messages & the dead-letter queue (E7)](#17-poison-messages--the-dead-letter-queue-e7)
   - [1.8 Increasing partitions & the re-keying risk (E8)](#18-increasing-partitions--the-re-keying-risk-e8)
+  - [1.9 Consumer lag & backpressure (E9)](#19-consumer-lag--backpressure-e9)
 
 ---
 
@@ -483,4 +484,63 @@ plan capacity up front instead of reorganizing a live topic under load.
   assumes a key maps to one partition.
 - Downstream consumers that cached `key → partition` assumptions (or external state keyed by
   partition) must be revisited after a resize.
+
+---
+
+## 1.9 Consumer lag & backpressure (E9)
+
+**Concept.** **Consumer lag** is how far a group is behind the head of a partition:
+`lag = high_watermark − committed_offset`. It is the single most important health signal of a
+streaming system — it grows whenever the **ingest rate exceeds the processing rate**, and a steadily
+climbing lag means the system is falling behind (latency rises, recovery takes longer).
+
+**How it works.**
+- Each partition's lag is independent; a group's total lag is the sum across the partitions it owns.
+- Lag rises when producers outpace consumers and falls when consumers catch up (or the producer
+  stops). It is a *rate* problem: you must either slow ingest or speed up/scale processing.
+- **Backpressure** is the umbrella term for keeping a fast producer from overwhelming a slow
+  consumer. Kafka's buffer is the log itself (bounded by retention), so "backpressure" here means
+  monitoring lag and adding processing capacity — not blocking the producer.
+
+**How to test.** An env-guarded delay (`RISK_WORKER_PROCESS_DELAY_MS`, default 0) makes
+`risk_worker` sleep per message to simulate expensive work; drive a fast producer and watch lag:
+```powershell
+# Terminal A — slow consumer
+$env:RISK_WORKER_PROCESS_DELAY_MS = "500"
+python -m src.transaction_processor.services.risk_worker
+# Terminal B — fast producer
+python -m src.transaction_processor.services.producer_simulator --count 300 --sleep-ms 5
+# Terminal C — watch lag climb (or use Kafka UI -> Consumers -> risk-cg)
+python -m src.transaction_processor.services.offset_admin --group risk-cg --topic txn.created
+```
+
+**How to validate (E9 observed, 6 partitions / 3 slow consumers).**
+```
+partition=0 committed=136 low=20 high=162 lag=26
+partition=1 committed=221 low=40 high=267 lag=46
+partition=2 committed=222 low=40 high=267 lag=45
+partition=3 committed=<none> low=0 high=0 lag=0     # idle: no records routed here this run
+partition=4 committed=22  low=0  high=66  lag=44
+partition=5 committed=39  low=0  high=66  lag=27
+total_lag=188
+```
+- Each consumer drained its owned partitions in parallel, but lag still grew because per-message
+  work (500 ms) was slower than the producer.
+- Adding consumers (1 → 2 → 3) split partitions among them and increased aggregate drain rate.
+- Stopping the producer let lag fall as the backlog cleared.
+
+**Why it's helpful.** Lag turns a vague "is it keeping up?" into a precise, alertable number. It
+drives capacity decisions (how many consumers / partitions) and is the trigger for autoscaling and
+incident response in production stream systems.
+
+**Gotchas.**
+- **Partition skew** shows up as uneven lag: a hot partition (or idle one like p3 above) means some
+  consumers are saturated while others sit idle — total throughput is capped by the slowest/hottest
+  partition, not the average.
+- Adding consumers helps **only up to the partition count** (E3 ceiling); beyond that you must add
+  partitions (E8, with its re-keying caveat).
+- Lag can also grow from **downstream** stalls (a slow DB/API the worker calls), not just CPU —
+  find the real bottleneck before scaling blindly.
+- Retention is the real backstop: if lag exceeds what retention holds, unprocessed records can **age
+  out** (low watermark passes committed) → data loss. Monitor lag against retention.
 
