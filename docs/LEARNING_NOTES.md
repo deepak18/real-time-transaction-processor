@@ -129,7 +129,9 @@ python -m src.transaction_processor.services.producer_simulator --count 60 --sle
 - Two instances → the 3 partitions split with **no overlap** (E2 observed: #1 owned `#2`; #2
   owned `#0,#1`).
 - Four instances → exactly **three** own one partition each; the **4th logs `ASSIGNED -> <none>`**
-  and processes zero messages.
+  and processes zero messages (E3 observed final split: `#2 / #0 / #1 / <none>`). The idle 4th is
+  **assignor-independent** — it stays idle under both eager and cooperative-sticky, because the
+  cause is *partitions < consumers*, not the rebalance protocol.
 - Kafka UI → Consumers → `risk-cg` shows members, their partition assignments, and **lag**.
 - Kill an active member → a previously idle member immediately picks up the freed partition.
 

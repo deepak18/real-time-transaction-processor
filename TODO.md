@@ -213,7 +213,7 @@ findings.
   - Watch partitions get split between them; kill one and watch a **rebalance** reassign
     partitions to the survivor. Note the brief pause.
 
-- **E3 — Over-provision consumers**
+- **E3 — Over-provision consumers** ✅ (done — see Findings Log)
   - Start **4** `risk_worker` instances on a 3-partition topic.
   - Observe that the 4th consumer stays **idle** (more consumers than partitions = waste).
   - Lesson: partition count is the ceiling on consumer parallelism.
@@ -308,6 +308,16 @@ findings.
   change hands are revoked, so unaffected partitions keep processing (much smaller pause). This
   is the preferred assignor for large/frequently-redeployed consumer groups. Deep-dive notes and
   the eager-vs-cooperative comparison live in `docs/LEARNING_NOTES.md`.
+
+- [E3] 2026-06-30 — Started **four** `risk_worker` instances against the 3-partition
+  `txn.created` (cooperative-sticky assignor still set from the E2 follow-up). — As each instance
+  joined, exactly **one** partition migrated incrementally: instance #1 began with `#0,#1,#2`,
+  handed `#0` to instance #2, then `#1` to instance #3, and kept `#2`. The **4th** instance
+  (`risk-15316`) only ever logged `ASSIGNED -> <none>` and processed zero messages. Final split:
+  `#2 / #0 / #1 / <none>`. — Takeaway: a partition is owned by exactly one consumer in a group,
+  so **partition count is the hard ceiling on parallelism** — extra consumers sit idle as hot
+  standby (assignor-independent: the 4th is idle under both eager and cooperative). To scale past
+  3 you must add partitions (E8), which can't later be reduced.
 
 ---
 
