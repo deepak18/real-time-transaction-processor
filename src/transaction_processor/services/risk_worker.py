@@ -1,4 +1,5 @@
 import os
+import time
 
 from confluent_kafka import Consumer, Producer, TopicPartition
 
@@ -16,6 +17,11 @@ WORKER_ID = f"risk-{os.getpid()}"
 # re-read and txn.risk_scored is emitted a SECOND time -> proves at-least-once delivery
 # and motivates idempotency/exactly-once (Phase 3).
 CRASH_AFTER_PRODUCE = os.getenv("RISK_WORKER_CRASH_AFTER_PRODUCE", "0") == "1"
+
+# E9: slow-processing knob (OFF by default). When RISK_WORKER_PROCESS_DELAY_MS > 0, the
+# worker sleeps that long per message to simulate expensive processing. Drive a fast
+# producer against a slow consumer and watch consumer LAG grow (Kafka UI / offset_admin).
+PROCESS_DELAY_MS = int(os.getenv("RISK_WORKER_PROCESS_DELAY_MS", "0"))
 
 
 class _FaultInjected(Exception):
@@ -54,6 +60,9 @@ def main() -> None:
             try:
                 txn_event = from_json_bytes(msg.value())
                 txn = txn_event["body"]
+                # E9: simulate slow processing so lag builds under a fast producer.
+                if PROCESS_DELAY_MS > 0:
+                    time.sleep(PROCESS_DELAY_MS / 1000)
                 result = score_transaction(txn)
                 out_event = build_event(
                     event_type=TOPICS["risk_scored"],
