@@ -296,6 +296,17 @@ findings.
   group; adding/removing members auto-redistributes partitions via a rebalance, and the default
   eager protocol briefly revokes everything (stop-the-world pause) before reassigning.
 
+- [E2-followup] 2026-06-30 — Made the consumer assignor env-driven
+  (`KAFKA_PARTITION_ASSIGNMENT_STRATEGY`, default `range,roundrobin` = eager) and re-ran the
+  two-instance test with `cooperative-sticky`. — Instance #1 started owning all three
+  (`#0, #1, #2`). When instance #2 joined, #1 logged only `REVOKED -> #0` (it **kept** `#1`/`#2`
+  the whole time) and #2 ended up `ASSIGNED -> #0`. Only **one** partition moved; the other two
+  never paused. Contrast with the eager run where the survivor revoked *all three* first. —
+  Takeaway: cooperative-sticky rebalances are **incremental** — only partitions that actually
+  change hands are revoked, so unaffected partitions keep processing (much smaller pause). This
+  is the preferred assignor for large/frequently-redeployed consumer groups. Deep-dive notes and
+  the eager-vs-cooperative comparison live in `docs/LEARNING_NOTES.md`.
+
 ---
 
 ## 9. Notes for a New AI Assistant (read me)

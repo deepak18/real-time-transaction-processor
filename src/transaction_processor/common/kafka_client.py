@@ -16,5 +16,7 @@ def consumer_config(group_id: str, auto_offset_reset: str = "earliest") -> Dict[
         "group.id": group_id,
         "auto.offset.reset": auto_offset_reset,
         "enable.auto.commit": False,
+        # E2 follow-up: choose eager (default) vs cooperative-sticky rebalancing.
+        "partition.assignment.strategy": settings.partition_assignment_strategy,
     }
 
