@@ -129,8 +129,6 @@ real-time-transaction-processor/
 - **Docker**: project-scoped names to avoid clashing with the sibling `kafka-streaming-orders`
   project — container `rtp-kafka`, volume `rtp_kafka_data`, UI `rtp-kafka-ui` on `:8080`.
   `KAFKA_AUTO_CREATE_TOPICS_ENABLE=false` (topics are created explicitly via `topic_admin.py`).
-- **Note:** `lock_manager.py` and `signature_utils.py` in `common/` are leftover coding-exercise
-  scratch files and are **not** part of the transaction pipeline. They can be removed/relocated.
 
 ### How to run (summary; full details in README.md)
 ```powershell
@@ -157,10 +155,10 @@ Status legend: ✅ done · 🚧 in progress · ⬜ not started.
 | Phase | Trigger problem | Technology / concept introduced | Status |
 |------|------------------|----------------------------------|--------|
 | **0. Foundations** | Need an entry point + async backbone | Kafka (KRaft), FastAPI ingress, worker chain, DLQ, src layout, Docker | ✅ |
-| **1. Kafka Core Mastery** | Understand scaling & ordering before adding tech | Partitions, keys, consumer groups, rebalancing, offsets, delivery semantics, DLQ | 🚧 (see §5 — focus area) |
-| **2. Schema & Contracts** | JSON drift breaks consumers silently | Schema Registry + Avro/Protobuf, versioned contracts, compatibility modes | ⬜ |
-| **3. Idempotency & Exactly-Once** | Retries cause double settlement | Idempotent producer, transactions/EOS, idempotency keys, dedup store | ⬜ |
-| **4. State & Stream Processing** | Need windowed fraud rules / aggregations | Stateful processing (e.g., Faust/Kafka Streams concepts), state stores | ⬜ |
+| **1. Kafka Core Mastery** | Understand scaling & ordering before adding tech | Partitions, keys, consumer groups, rebalancing, offsets, delivery semantics, DLQ | ✅ (E1–E10 done) |
+| **2. Schema & Contracts** | JSON drift breaks consumers silently | Schema Registry + Avro/Protobuf, versioned contracts, compatibility modes | 🚧 (next focus — see §5b) |
+| **3. Idempotency & Exactly-Once** | Retries cause double settlement | Idempotent producer, transactions/EOS, idempotency keys, dedup store | ⬜ (planned — see §5b) |
+| **4. State & Stream Processing** | Need windowed fraud rules / aggregations | Stateful stream processing — **Apache Flink (PyFlink)** leading option; alts: Kafka Streams, Bytewax, Faust | ⬜ |
 | **5. Persistence & Query** | "What's the status of txn X?" needs a queryable store | PostgreSQL (write model / read model), CQRS-lite | ⬜ |
 | **6. Caching & Hot State** | Risk lookups hammer the DB | Redis (cache, rate limits, distributed locks) | ⬜ |
 | **7. Observability** | Can't see lag/throughput/failures | Metrics (Prometheus), tracing, structured logging, consumer-lag monitoring | ⬜ |
@@ -173,12 +171,10 @@ Status legend: ✅ done · 🚧 in progress · ⬜ not started.
 
 ---
 
-## 5. Phase 1 — Kafka Core Concepts (current focus) 🚧
+## 5. Phase 1 — Kafka Core Concepts (COMPLETE ✅)
 
-This is where we are now. The goal is to deeply understand Kafka's building blocks **by
-experimenting on the existing pipeline**. For each concept below: read the explanation,
-run the experiment, observe the result (use Kafka UI on `http://localhost:8080`), and note
-findings.
+Phase 1 is done — all experiments E1–E10 have been run on the pipeline. This section is kept as
+a reference for the concepts and experiments. The active work has moved to **§5b (Phase 2)**.
 
 ### 5.1 Concepts to learn
 1. **Topics & partitions** — a topic is split into partitions; partitions are the unit of
@@ -245,7 +241,7 @@ findings.
     and observe the **duplicate** `txn.risk_scored` for the same `txn_id`.
   - This motivates Phase 3 (idempotency/EOS). See `docs/LEARNING_NOTES.md` §1.6 for run/validate.
 
-- **E7 — Poison message → DLQ** 🚧 (tooling wired — run & log findings)
+- **E7 — Poison message → DLQ** ✅ (done — see Findings Log)
   - Inject a malformed event onto `txn.created` with
     `producer_simulator --poison N [--poison-kind missing-field|bad-json]`.
   - Confirm it lands in `txn.dlq` (now with `txn_id`/source coordinates) and the worker keeps
@@ -274,6 +270,81 @@ findings.
 
 ---
 
+## 5b. Phase 2 & 3 — Detailed Plan (next focus) 🚧
+
+> These two phases are tightly linked: Phase 2 makes the **event contract** explicit and safe to
+> evolve; Phase 3 makes **processing** safe to retry/replay. Both build directly on Phase 1.
+
+### Phase 2 — Schema & Contracts (Schema Registry)
+**Trigger problem to demonstrate FIRST (problem-first rule):** today every event is a hand-built
+dict serialized with `json.dumps` in `common/events.py`. Nothing enforces shape or type. To make
+the pain real: change the producer's payload (rename `amount` → `amount_cents`, or change a type),
+and watch a downstream worker silently mis-handle it or `KeyError` at runtime — a *silent contract
+break* that only fails in production.
+
+**Technology introduced:** **Confluent Schema Registry** + a schema'd serialization format.
+- Add `schema-registry` to `docker-compose.yaml` (project-scoped, e.g. `rtp-schema-registry`).
+- Define a schema per event type (start with `txn.created`, then the rest).
+- Switch producers/consumers to Schema-Registry-aware (de)serializers; the registry stores schema
+  versions and assigns a schema **ID** embedded in each message.
+- Enforce a **compatibility mode** (`BACKWARD` recommended) so incompatible changes are *rejected
+  at publish time*, not discovered downstream.
+
+**Format decision (compare):**
+- **Avro** — Kafka-classic, compact, great schema-evolution story, first-class registry support. *Default recommendation.*
+- **Protobuf** — strong typing, polyglot/gRPC synergy, also registry-supported.
+- **JSON Schema** — keeps human-readable JSON; least efficient, easiest migration from today's JSON.
+
+**Concepts to learn:** schema evolution, compatibility modes (BACKWARD/FORWARD/FULL), subject
+naming strategies, schema IDs on the wire, why the value of schemas grows with the number of
+independent consumers.
+
+**Experiments (P2):**
+- **P2-E1** Register `txn.created` schema; produce/consume via Avro; inspect the schema in the registry.
+- **P2-E2** Make a **backward-compatible** change (add an optional field with default) → succeeds; old consumers still read.
+- **P2-E3** Make a **breaking** change (remove/rename a required field) → registry **rejects** it under BACKWARD. This is the "problem solved" moment.
+- **P2-E4** Consumer reads a newer-schema message with an older schema (demonstrate resolution).
+
+**Exit criteria:** can explain compatibility modes and show a breaking change being rejected before it reaches consumers.
+
+### Phase 3 — Idempotency & Exactly-Once (EOS)
+**Trigger problem (already demonstrated in E6):** at-least-once + retries/replay ⇒ **duplicate
+`txn.risk_scored`** ⇒ in a real system, **double settlement**. We have the proof from E6; now we fix it.
+
+**Three layers (teach the distinction — this is the key insight):**
+1. **Idempotent producer** (`enable.idempotence=true`, `acks=all`): dedups *producer retry*
+   duplicates within a partition via sequence numbers. Cheap, always-on best practice. Does NOT
+   solve consumer-side reprocessing.
+2. **Kafka transactions / EOS** (`transactional.id`, `begin_transaction` →
+   produce → `send_offsets_to_transaction` → `commit_transaction`): makes the **read-process-write**
+   loop atomic — the output event and the input offset commit happen together or not at all. The
+   E6 crash would then yield **no** duplicate.
+3. **Application-level idempotency keys / dedup store:** EOS only covers **Kafka→Kafka**. Any
+   **external** side effect (settlement, DB write, calling a payment rail) still needs an
+   idempotency key + a dedup table so a retry is a no-op. This naturally introduces the need for
+   **PostgreSQL** (Phase 5) as the dedup/store of record.
+
+**Experiments (P3):**
+- **P3-E1** Turn on the idempotent producer; confirm config and acks semantics.
+- **P3-E2** Wrap `risk_worker` in a Kafka transaction; re-run the E6 crash; show the duplicate is **gone**.
+- **P3-E3** Show EOS does NOT cover an external effect: simulate a settlement side effect and prove a replay double-applies it WITHOUT an idempotency key; then add a dedup key (in-memory first) and show it becomes safe → motivates Phase 5 Postgres.
+
+**Exit criteria:** can explain idempotent-producer vs transactions vs app-level idempotency, and
+point to where each is (and is NOT) sufficient; the E6 duplicate is eliminated for the Kafka→Kafka path.
+
+### Phase 4 note — is Apache Flink a good fit?
+**Yes.** For windowed/stateful fraud rules (velocity checks, "N txns per card per 5 min", rolling
+aggregates), **Flink is an excellent, industry-standard fit**: event-time processing with
+watermarks, keyed state, windowing, CEP for fraud patterns, and exactly-once via checkpointing.
+Trade-off: it's a heavier system (JobManager/TaskManager) and its richest ecosystem is JVM.
+**Recommendation:** keep it Python-first with **PyFlink** (real Flink, Python API) to learn the
+canonical concepts that transfer everywhere; lighter Python-native alt is **Bytewax**; **Kafka
+Streams** is JVM-only; **Faust** is Python but less actively maintained. As always, demonstrate the
+problem first (a naive in-memory windowed counter that loses state on restart and can't scale),
+*then* introduce Flink to solve it.
+
+---
+
 ## 6. Conventions & Decisions (locked)
 - **src layout** packaging with explicit module execution (`python -m ...`).
 - **Topic & group names** only via `common/topics.py` — never hard-code strings elsewhere.
@@ -288,10 +359,12 @@ findings.
 ---
 
 ## 7. Next Actions (pick up here) ▶️
-1. **Finish Phase 1 experiments E1–E10** and record findings (add entries to §8).
-2. Decide the **Phase 2 trigger**: introduce Schema Registry once we intentionally break a
-   consumer with a JSON shape change (demonstrate the problem first).
-3. Keep the README run-book and this roadmap in sync after each phase.
+1. ✅ **Phase 1 complete** — all Kafka core experiments E1–E10 done (findings in §8).
+2. **Start Phase 2 (Schema & Contracts)** per §5b: FIRST demonstrate a silent JSON contract break,
+   THEN add Confluent Schema Registry + Avro and enforce `BACKWARD` compatibility (P2-E1…E4).
+3. **Then Phase 3 (Idempotency/EOS)** per §5b: idempotent producer → Kafka transactions (eliminate
+   the E6 duplicate) → app-level idempotency keys (motivates Phase 5 PostgreSQL).
+4. Keep `README.md`, this roadmap, and `docs/LEARNING_NOTES.md` in sync after each phase.
 
 ---
 
