@@ -23,6 +23,7 @@
   - [1.2 Consumer groups & horizontal scaling (E2, E3)](#12-consumer-groups--horizontal-scaling-e2-e3)
   - [1.3 Rebalancing: eager vs cooperative-sticky (E2 follow-up)](#13-rebalancing-eager-vs-cooperative-sticky-e2-follow-up)
   - [1.4 Config & command cheat-sheet](#14-config--command-cheat-sheet)
+  - [1.5 Offsets, commits & replay (E5)](#15-offsets-commits--replay-e5)
 
 ---
 
@@ -247,4 +248,60 @@ python -m src.transaction_processor.services.risk_worker         # run a worker 
 python -m src.transaction_processor.services.producer_simulator --count 60 --sleep-ms 50
 # Kafka UI: http://localhost:8080  (partitions, offsets, consumer-group lag)
 ```
+
+---
+
+## 1.5 Offsets, commits & replay (E5)
+
+**Concept.** An **offset** is a consumer's position within a partition. The *committed* offset is
+**durable, server-side state** for a `group.id`, stored in Kafka's internal `__consumer_offsets`
+topic — not in the consumer process. Because the log itself is retained, you can **rewind** a
+group's committed offsets and **replay** history. This is a defining superpower of a log over a
+traditional queue (which deletes messages on acknowledgement).
+
+**How it works.**
+- **Watermarks:** each partition has a **low** watermark (oldest offset still retained) and a
+  **high** watermark (next offset to be written). **Lag = high − committed**.
+- **Commit strategy:** we use manual commits (`enable.auto.commit=False`) committed *after*
+  processing → at-least-once (see §1.2).
+- **`auto.offset.reset` is a bootstrap-only fallback** — it only decides where a group starts when
+  it has **no** committed offset. It does *not* trigger replay for a group that has already
+  committed.
+- **Replay = reset committed offsets.** `services/offset_admin.py` reads watermarks and commits new
+  offsets for the group: `earliest` → low watermark (reprocess), `latest` → high watermark (skip
+  backlog). It never `subscribe()`s, so it won't rebalance live members. **Stop the group's
+  workers before resetting** — active members can overwrite the committed offset.
+
+**How to test.**
+```powershell
+# inspect committed offsets, watermarks, and lag
+python -m src.transaction_processor.services.offset_admin --group risk-cg --topic txn.created
+# rewind to replay (workers stopped), or fast-forward to skip
+python -m src.transaction_processor.services.offset_admin --group risk-cg --reset earliest
+python -m src.transaction_processor.services.offset_admin --group risk-cg --reset latest
+```
+
+**How to validate (E5 observed).**
+- Caught up: `committed == high`, `total_lag = 0`.
+- `--reset earliest` → committed dropped to the **low watermarks `20 / 40 / 40` (not 0)** and
+  `total_lag` jumped to **301**; restarting `risk_worker` replayed that history.
+- `--reset latest` → committed returned to the **high watermarks**, `total_lag = 0`; a restart
+  would process only new messages.
+
+**Why it's helpful.** Replay is how you **recover from bugs** (fix logic, rewind, reprocess),
+**backfill new consumers** (a fresh `group.id` reads from `earliest`), and **triage incidents**
+(jump to `latest` to shed a stale backlog). Per-group offsets mean rewinding `risk-cg` never
+disturbs `audit-cg`.
+
+**Gotchas.**
+- **You can only rewind as far back as the low watermark.** In E5, offsets `0–19`/`0–39` had
+  already aged out via retention, so replay started at `20/40/40` — older data is gone for good.
+- Replay under **at-least-once re-emits duplicates** downstream — safe reprocessing needs
+  idempotency (Phase 3).
+- Resetting offsets while the group has **live members** is unreliable; stop them first (or use a
+  dedicated admin group).
+- Alternatives: Kafka UI's consumer-group screen, or the canonical CLI
+  `kafka-consumer-groups.sh --reset-offsets --to-earliest --execute --group risk-cg --topic txn.created`.
+  Both can also reset **to a timestamp** (e.g., "replay since 09:00"), which our tool could add via
+  `--to-timestamp` later.
 
