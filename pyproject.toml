@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "real-time-transaction-processor"
+version = "0.1.0"
+description = "Kafka-based real-time transaction processing learning platform"
+requires-python = ">=3.10"
+dependencies = [
+  "confluent-kafka>=2.8.2",
+  "fastapi>=0.115.0",
+  "uvicorn[standard]>=0.30.0",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
