@@ -25,6 +25,7 @@
   - [1.4 Config & command cheat-sheet](#14-config--command-cheat-sheet)
   - [1.5 Offsets, commits & replay (E5)](#15-offsets-commits--replay-e5)
   - [1.6 Delivery semantics & at-least-once duplicates (E6)](#16-delivery-semantics--at-least-once-duplicates-e6)
+  - [1.7 Poison messages & the dead-letter queue (E7)](#17-poison-messages--the-dead-letter-queue-e7)
 
 ---
 
@@ -373,3 +374,58 @@ Phase 3 (idempotency / exactly-once) — we add the fix only after demonstrating
   the offset truly stays put across the crash.
 - The duplicate is **downstream** (`txn.risk_scored`); the source `txn.created` is read twice but
   exists once. Idempotency must therefore key on a stable id (`txn_id`), not on re-delivery counts.
+
+---
+
+## 1.7 Poison messages & the dead-letter queue (E7)
+
+**Concept.** A **poison message** is a record a consumer can never process successfully — malformed
+JSON, a missing required field, a schema mismatch. Under at-least-once with commit-after-process,
+naively letting it throw means the offset is **never committed**, so the consumer re-reads the same
+bad record forever and the **whole partition stalls** behind it (head-of-line blocking). The fix is
+a **dead-letter queue (DLQ)**: route the un-processable record to a side topic (`txn.dlq`) and
+**commit the source offset anyway**, so the partition keeps flowing.
+
+**How it works (in `risk_worker.py`).**
+- The processing body is wrapped in `try/except`. On any non-fault exception we:
+  1. best-effort parse the bytes to recover `txn_id`/`card_id` (may fail for `bad-json`),
+  2. publish a DLQ envelope to `txn.dlq` carrying the `error` and **source coordinates**
+     (`source_topic`/`source_partition`/`source_offset`) plus the `raw` bytes,
+  3. **commit the source offset** so the poison can't block the partition.
+- The DLQ record is keyed by `card_id` when recoverable, preserving per-card grouping.
+- The E6 `_FaultInjected` crash is re-raised *above* this handler, so a deliberate crash is **not**
+  swallowed into the DLQ (it must leave the offset uncommitted).
+
+**How to test.** `producer_simulator` can inject poison interleaved with good traffic (so you can
+see the worker recover and keep going):
+```powershell
+# missing-field: valid envelope, body has no 'amount' -> fails in risk_engine
+python -m src.transaction_processor.services.producer_simulator --count 20 --poison 2
+
+# bad-json: raw non-JSON bytes -> fails at deserialization (also exercises audit's parser)
+python -m src.transaction_processor.services.producer_simulator --count 20 --poison 2 --poison-kind bad-json
+```
+
+**How to validate.**
+- `risk_worker` logs `DLQ <- poison txn=… src=txn.created#P@O error=…` for each bad record, then
+  continues logging `risk scored …` for the good ones that follow — **no stall**.
+- Kafka UI → `txn.dlq` shows one record per poison, with the error and source offset in the body;
+  `risk-cg` lag on `txn.created` returns to 0 (the poison offset was committed, not retried).
+- `audit_worker` logs the DLQ records (it subscribes to `txn.dlq`); a `bad-json` poison on
+  `txn.created` shows up as `audit UNPARSEABLE …` instead of crashing the auditor.
+
+**Why it's helpful.** One malformed event in a high-throughput stream must not halt an entire
+partition (and every card hashed to it). A DLQ **isolates** bad data for later inspection/replay
+while keeping the pipeline live — the standard pattern for resilient stream processing.
+
+**Gotchas.**
+- **Commit-after-DLQ is deliberate.** If you DLQ but *don't* commit, you re-process the poison
+  forever — the very stall you were avoiding.
+- A DLQ is **at-least-once too**: the same poison can appear in `txn.dlq` more than once if the
+  worker crashes between the DLQ produce and the commit. Dedupe on `txn_id`/source offset when
+  draining it.
+- Decide a **DLQ policy**: alert on non-empty DLQ, and build a tool to inspect/repair/replay
+  (a fixed message can be re-emitted to the source topic).
+- Distinguish **poison** (never succeeds → DLQ) from **transient** failures (broker blip, timeout →
+  retry/back-off). Blindly DLQ-ing transient errors discards recoverable data.
+

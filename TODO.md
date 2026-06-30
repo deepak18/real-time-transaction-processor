@@ -245,9 +245,11 @@ findings.
     and observe the **duplicate** `txn.risk_scored` for the same `txn_id`.
   - This motivates Phase 3 (idempotency/EOS). See `docs/LEARNING_NOTES.md` §1.6 for run/validate.
 
-- **E7 — Poison message → DLQ**
-  - Produce a malformed event onto `txn.created` (e.g., missing `amount`).
-  - Confirm it lands in `txn.dlq` and the worker keeps processing subsequent messages.
+- **E7 — Poison message → DLQ** 🚧 (tooling wired — run & log findings)
+  - Inject a malformed event onto `txn.created` with
+    `producer_simulator --poison N [--poison-kind missing-field|bad-json]`.
+  - Confirm it lands in `txn.dlq` (now with `txn_id`/source coordinates) and the worker keeps
+    processing subsequent messages. See `docs/LEARNING_NOTES.md` §1.7.
 
 - **E8 — Increase partitions**
   - Recreate a topic with more partitions (or use `topic_admin`), reproduce load, and observe
