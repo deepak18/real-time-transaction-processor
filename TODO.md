@@ -251,8 +251,8 @@ findings.
   - Confirm it lands in `txn.dlq` (now with `txn_id`/source coordinates) and the worker keeps
     processing subsequent messages. See `docs/LEARNING_NOTES.md` §1.7.
 
-- **E8 — Increase partitions**
-  - Recreate a topic with more partitions (or use `topic_admin`), reproduce load, and observe
+- **E8 — Increase partitions** ✅ (done — see Findings Log)
+  - Recreate a topic with more partitions (or use `topic_admin --alter`), reproduce load, and observe
     higher consumer parallelism. Discuss why you **can't reduce** partitions and how it affects
     key→partition mapping (re-keying risk).
 
@@ -371,7 +371,20 @@ findings.
   duplicate `txn_id` is identical, so safe reprocessing must dedup on a **stable id**, not on
   delivery count. (3) Both duplicates landed on the same partition (same `card_id` key → ordering
   preserved even across the crash). (4) This is the exact double-settlement failure mode that
-  motivates **Phase 3 (idempotency/EOS)**. Concept notes in `docs/LEARNING_NOTES.md`.
+  motivates **Phase 3 (idempotency/EOS)**. Concept notes in `docs/LEARNING_NOTES.md` §1.6.
+
+- [E8] 2026-06-30 — Extended `topic_admin` with `--describe` and `--alter NAME --partitions N`,
+  then grew `txn.created` from **3 → 6** partitions and re-ran `producer_simulator` to compare the
+  `card_id → partition` map before/after. — Before (mod 3): card-1→2, card-2→1, card-3→0, card-4→1,
+  card-5→2. After (mod 6): card-1→2, card-2→**4**, card-3→0, card-4→1, card-5→**5**. So **2 of 5
+  cards remapped** (card-2, card-5) while the other three stayed. The partitioner is
+  `murmur2(card_id) % N`: with a fixed hash `h`, a key stays put when `h%6 == h%3` and moves (to
+  `h%3 + 3`) otherwise — about half of keys move when doubling. Shrinking back was rejected:
+  `INVALID_PARTITIONS … 3 would not be an increase`. — Takeaways: (1) adding partitions raises the
+  parallelism ceiling (now up to 6 `risk_worker`s do work) but (2) **changes key→partition mapping
+  for future records**, so a card's new events can land on a different partition than its history —
+  **breaking per-card ordering** across the change. (3) Partitions can only **grow**, never shrink,
+  so size deliberately up front. Concept notes in `docs/LEARNING_NOTES.md` §1.8.
 
 ---
 

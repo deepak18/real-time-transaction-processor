@@ -26,6 +26,7 @@
   - [1.5 Offsets, commits & replay (E5)](#15-offsets-commits--replay-e5)
   - [1.6 Delivery semantics & at-least-once duplicates (E6)](#16-delivery-semantics--at-least-once-duplicates-e6)
   - [1.7 Poison messages & the dead-letter queue (E7)](#17-poison-messages--the-dead-letter-queue-e7)
+  - [1.8 Increasing partitions & the re-keying risk (E8)](#18-increasing-partitions--the-re-keying-risk-e8)
 
 ---
 
@@ -428,4 +429,58 @@ while keeping the pipeline live — the standard pattern for resilient stream pr
   (a fixed message can be re-emitted to the source topic).
 - Distinguish **poison** (never succeeds → DLQ) from **transient** failures (broker blip, timeout →
   retry/back-off). Blindly DLQ-ing transient errors discards recoverable data.
+
+---
+
+## 1.8 Increasing partitions & the re-keying risk (E8)
+
+**Concept.** Partition count is the **ceiling on consumer parallelism** (E3): with 3 partitions, at
+most 3 members of a group do work. To scale further you **add** partitions — but Kafka only ever
+lets you **grow** a topic, never shrink it, and growing **changes the key→partition mapping** for
+future records. That can silently break the per-key ordering you rely on.
+
+**How it works.**
+- The default partitioner is `partition = murmur2(key) % N`. The hash `h = murmur2(key)` is fixed
+  per key; only `N` changes when you add partitions.
+- A key **stays** on its partition only when `h % N_new == h % N_old`; otherwise it **moves**.
+  Doubling `3 → 6` keeps a key iff `h % 6 == h % 3` (i.e. `h % 6 < 3`), else it shifts to
+  `(h % 3) + 3`. Roughly **half** the keys move.
+- Only **future** records are repartitioned; records already written stay where they were. So a
+  card's history is split across the old and new partitions — and **ordering across that boundary
+  is no longer guaranteed** (a consumer can read the new-partition events before the old ones).
+- Partitions can't be reduced: `create_partitions` to a smaller/equal count is rejected with
+  `INVALID_PARTITIONS`.
+
+**How to test.** `topic_admin` now describes and grows partitions; `producer_simulator` prints the
+`card_id → partition` map so you can diff before/after:
+```powershell
+python -m src.transaction_processor.services.topic_admin --describe
+python -m src.transaction_processor.services.producer_simulator --count 30   # BEFORE map
+python -m src.transaction_processor.services.topic_admin --alter txn.created --partitions 6
+python -m src.transaction_processor.services.producer_simulator --count 30   # AFTER map
+python -m src.transaction_processor.services.topic_admin --alter txn.created --partitions 3  # rejected
+```
+
+**How to validate (E8 observed, 3 → 6).**
+- Before (`% 3`): card-1→2, card-2→1, card-3→0, card-4→1, card-5→2.
+- After (`% 6`): card-1→2, card-2→**4**, card-3→0, card-4→1, card-5→**5**.
+- **2 of 5 cards moved** (card-2, card-5); the rest stayed because `h % 6 == h % 3` for them. The
+  moved ones landed exactly on `(h % 3) + 3` (1→4, 2→5), confirming the modulus math.
+- Shrinking `6 → 3` failed: `KafkaError{code=INVALID_PARTITIONS … 3 would not be an increase}`.
+- With 6 partitions you can now run up to 6 working `risk_worker`s (the E3 ceiling rose from 3).
+
+**Why it's helpful.** Adding partitions is the primary lever to scale throughput past the
+consumer-count ceiling. Knowing *exactly* which keys remap (and that it's irreversible) lets you
+plan capacity up front instead of reorganizing a live topic under load.
+
+**Gotchas.**
+- **Re-keying breaks ordering.** After a resize, a key's new events may sit on a different
+  partition than its in-flight history → cross-partition reordering. Mitigate by resizing during a
+  quiet window, draining the old backlog first, or using a sticky/custom partitioner.
+- **Irreversible.** You can't shrink; over-provision deliberately (but not absurdly — each
+  partition has overhead: file handles, memory, rebalance cost, end-to-end latency).
+- **Log-compacted topics** especially dislike repartitioning — the "latest value per key" guarantee
+  assumes a key maps to one partition.
+- Downstream consumers that cached `key → partition` assumptions (or external state keyed by
+  partition) must be revisited after a resize.
 
